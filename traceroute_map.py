@@ -29,6 +29,7 @@ status_message = solara.reactive("Ready. Enter a destination and click 'Trace Ro
 locations = solara.reactive([])
 is_tracing = solara.reactive(False)
 map_layers = solara.reactive([])
+map_controls = solara.reactive([])
 
 # Initialize geolocators with timeout settings and no Google APIs
 geolocators = [
@@ -325,6 +326,7 @@ def update_map_layers():
     """
     locs = locations.value
     layers = []
+    controls = []
 
     # Add the base map layer
     base_map = ipyleaflet.basemap_to_tiles(maps[map_name.value])
@@ -354,50 +356,72 @@ def update_map_layers():
         # Create markers and collect their positions for the polyline
         marker_positions = []
         for i, loc in enumerate(locs):
-            color = "green"
             if i == 0:
-                color = "blue"
+                color_hex = "#1e3a8a"  # origin (blue)
             elif loc["ip"] == destination_name.value or i == len(locs) - 1:
-                color = "orange"
+                color_hex = "#c2410c"  # destination/last (orange)
+            else:
+                color_hex = "#15803d"  # intermediate (green)
 
-            # Create a unique key for the location based on coordinates
-            loc_key = f"{loc['lat']}_{loc['lon']}"
+            # Offset math (fan out overlapping points)
+            key = f"{loc['lat']}_{loc['lon']}"
+            if key not in location_offsets:
+                location_offsets[key] = 0
+            offset = location_offsets[key]
+            location_offsets[key] += 1
 
-            # Initialize offset for this location if it doesn't exist
-            if loc_key not in location_offsets:
-                location_offsets[loc_key] = 0
-
-            # Calculate offset for this marker
-            offset = location_offsets[loc_key]
-            location_offsets[loc_key] += 1
-
-            # Calculate the maximum offset needed for this location
-            max_offset = location_counts[loc_key] - 1
-
-            # Calculate the angle for this marker (evenly spaced around the location)
+            max_offset = location_counts[key] - 1
             angle = (offset / max_offset) * 2 * math.pi if max_offset > 0 else 0
-
-            # Calculate the offset distance (increase with more markers)
             offset_distance = 0.005 * (1 + max_offset * 0.1)
-
-            # Apply the offset to the marker position
             offset_lat = loc["lat"] + offset_distance * math.sin(angle)
             offset_lon = loc["lon"] + offset_distance * math.cos(angle)
 
-            # Store the marker position for the polyline
             marker_positions.append((offset_lat, offset_lon))
 
-            icon = ipyleaflet.AwesomeIcon(
-                name="info-circle", marker_color=color, icon_color="white"
-            )
-            marker = ipyleaflet.Marker(
-                location=(offset_lat, offset_lon), icon=icon, draggable=False
+            hop_no = i + 1
+            icon_html = f"""
+            <div style="
+                background:none;
+                border:none;
+                padding:0;
+                margin:0;
+            ">
+            <div style="
+                background:{color_hex};
+                width:28px;
+                height:28px;
+                line-height:28px;
+                border-radius:50%;
+                text-align:center;
+                color:#fff;
+                font-weight:700;
+                font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+                border:2px solid #fff;
+                box-shadow:0 1px 4px rgba(0,0,0,.4);
+            ">
+                {hop_no}
+            </div>
+            </div>
+            """
+
+            icon = ipyleaflet.DivIcon(
+                html=icon_html,
+                icon_size=[28, 28],
+                icon_anchor=[14, 14],
+                class_name="empty", 
             )
 
-            # Create a popup for the marker with improved styling
+            marker = ipyleaflet.Marker(
+                location=(offset_lat, offset_lon),
+                icon=icon,
+                draggable=False,
+                title=f"Hop {hop_no}: {loc['city']}, {loc['country']} ({loc['ip']})",
+            )
+
+            # Popup with hop no
             popup_content = f"""
             <div style="font-family: Arial, sans-serif; padding: 10px; max-width: 250px;">
-                <h3 style="margin-top: 0; color: #333;">Location Details</h3>
+                <h3 style="margin-top: 0; color: #333;">Hop {hop_no} — Location Details</h3>
                 <div style="margin-bottom: 8px;">
                     <strong style="color: #555;">City:</strong> {loc['city']}
                 </div>
@@ -428,6 +452,84 @@ def update_map_layers():
             locations=marker_positions, color="#3388ff", fill=False, weight=3
         )
         layers.append(polyline)
+
+        # -------- Top-right "Hops" list --------
+        hop_widgets = []
+        title = widgets.HTML(
+            value="""
+            <div style="font-weight:600;font-family:system-ui,Arial;
+                        padding:6px 8px;border-bottom:1px solid #e5e7eb;">
+                Hops
+            </div>
+            """
+        )
+        hop_widgets.append(title)
+
+        for i, loc in enumerate(locs):
+            hop_no = i + 1
+            label = f"{hop_no}. {loc['city']}, {loc['country']} ({loc['ip']})"
+            coord_key = f"{loc['lat']}_{loc['lon']}"
+            count_here = location_counts.get(coord_key, 1)
+
+            if count_here >= 5:
+                target_zoom = 14
+            elif count_here >= 3:
+                target_zoom = 13
+            elif count_here == 2:
+                target_zoom = 12
+            else:
+                target_zoom = 9
+
+            lat, lon = marker_positions[i]
+
+            btn = widgets.Button(
+                description=label,
+                layout=widgets.Layout(width="280px"),
+                tooltip=f"Center on hop {hop_no}",
+                button_style="",
+                style={"text_align": "left"},
+            )
+            btn.layout.padding = "0 6px"
+
+            def _make_on_click(lat_, lon_, z_):
+                def _on_click(_):
+                    map_center.value = (lat_, lon_)
+                    map_zoom.value = max(z_, map_zoom.value)
+                return _on_click
+
+            btn.on_click(_make_on_click(lat, lon, target_zoom))
+            hop_widgets.append(btn)
+
+        list_box = widgets.VBox(
+            children=hop_widgets,
+            layout=widgets.Layout(
+                border="1px solid #e5e7eb",
+                box_shadow="0 2px 8px rgba(0,0,0,0.08)",
+                background_color="white",
+                width="300px",
+                max_height="320px",
+                overflow_y="auto",
+            ),
+        )
+
+        hops_control = ipyleaflet.WidgetControl(widget=list_box, position="topright")
+        
+        # --- CSS injection to remove the box behind markers
+        css = widgets.HTML(
+            value="""
+            <style>
+            /* kill the white square & border Leaflet adds to DivIcon */
+            .leaflet-div-icon {
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+            }
+            </style>
+            """
+        )
+        
+        controls.append(ipyleaflet.WidgetControl(widget=css, position="topleft"))
+        controls.append(hops_control)
     else:
         # Reset to default view if no locations
         my_loc = get_my_location()
@@ -435,7 +537,7 @@ def update_map_layers():
         map_zoom.value = 5
 
     map_layers.value = layers
-
+    map_controls.value = controls
 
 @solara.component
 def Page():
@@ -467,12 +569,12 @@ def Page():
                             solara.ProgressLinear(True)
                         solara.Text(status_message.value)
 
-            # This column will grow to fill the remaining space in the row
             with solara.Column(style={"flex-grow": "1"}):
                 ipyleaflet.Map.element(
                     center=map_center.value,
                     zoom=map_zoom.value,
                     layers=map_layers.value,
+                    controls=map_controls.value,
                     scroll_wheel_zoom=True,
                     layout={"height": "100%"},
                 )
